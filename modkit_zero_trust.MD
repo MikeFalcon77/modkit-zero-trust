@@ -1,16 +1,17 @@
 ﻿# Design Overview: Zero-Trust OoP Modules with SPIFFE-light and STS
 
-This document describes the security and communication architecture for a modular Rust system with:
+Scope:
 
 * On-prem targets: Windows, macOS.
 * Cloud target: Kubernetes (Linux).
-* OoP (out-of-process) modules communicating via REST (first-class, over HTTP/2) and optionally gRPC.
-* Zero-trust east-west traffic using mTLS (workload identity) plus a short-lived internal token (delegation and canonical security context).
+* HTTP/2 is the default transport; REST is the primary API style; gRPC is optional.
+* OoP (out-of-process) modules.
+* Zero-trust east-west traffic using mTLS (workload identity) plus a short-lived internal token (downscoped authorization context).
 * External clients arriving with tokens issued by their own Identity Providers (IdP).
 
-The design explicitly separates control plane and data plane responsibilities.
+Control plane and data plane responsibilities are separated.
 
-This design is aligned with Zero Trust principles in NIST SP 800-207 (focus on identity, continuous verification, and removing network location trust). ([NIST Publications][2])
+Aligned with Zero Trust principles in NIST SP 800-207. ([NIST Publications][2])
 
 ---
 
@@ -35,9 +36,42 @@ This design is aligned with Zero Trust principles in NIST SP 800-207 (focus on i
 
 ---
 
+## Design principles (clarifications)
+
+### SPIFFE-light is not a security model
+
+SPIFFE-light role:
+
+* **SPIFFE-light is an identity transport and naming convention, not a security model.**
+* SPIFFE-light provides:
+  * a standardized workload identifier format (SPIFFE ID),
+  * a mechanism to prove that identity cryptographically (X.509 SVID via mTLS),
+  * a trust bundle distribution concept.
+* SPIFFE-light does **not** provide policy, authorization, or delegation by itself.
+
+Zero Trust properties are enforced by policy + enforcement:
+
+* mTLS proves *workload identity* (who is the caller workload).
+* internal tokens minted by STS carry *authorization artifacts* and canonical context (what the caller is allowed to do, for which tenant, and for which audience).
+* each module performs authorization decisions per operation.
+
+### STS does not create identity
+
+External identity originates at external IdPs (human login, device auth, external service auth).
+
+**STS does not create identity. STS creates authorization artifacts bound to an already verified identity.**
+
+STS role:
+
+* It validates/normalizes external tokens (via IdP plugin logic).
+* It performs token exchange and downscoping (audience restriction, TTL bounding, optional capability semantics).
+* It mints short-lived internal tokens used inside the trust boundary.
+
+---
+
 ## Threat model and security goals
 
-### What we assume can go wrong (because it will)
+### What we assume can go wrong
 
 1. Network is hostile:
 
@@ -121,38 +155,27 @@ Responsibilities:
 
 * Request routing and proxying
 * Cryptographic validation (TLS, token signatures)
-* Rate limits and quotas
+* Rate limits and quotas (enforced in data plane; configured by control plane)
 * Request/response transformation
 * Observability (metrics, logs, tracing)
 
 Important:
-`api_ingress` is intentionally a pure data plane component. It enforces decisions produced by the control plane but does not own identity, policy, or lifecycle state.
+`api_ingress` is a data plane component. It MUST NOT own identity, policy, or lifecycle state.
 
 ---
 
-## Why this design works well
+## Why this design works well (Informative)
 
-1. Identity is separated from location
-   Services are discovered via Directory. Trust is established cryptographically (mTLS + tokens), not via IPs or DNS.
-
-2. External token formats stop at the edge
-   Only `api_ingress` and STS understand external IdP tokens. Internal services see a single canonical security model.
-
-3. Zero-trust east-west without a gateway bottleneck
-   Module-to-module traffic goes direct, but every request is authenticated and authorized.
-
-4. Matches industry-proven patterns
-
-   * SPIFFE/SVID: workload identity via certificates ([SpiFFE][4])
-   * STS: short-lived, scoped credentials
-   * Boundary authentication with internal authorization
+* Directory is the service discovery source of truth; identity is not derived from DNS/IP.
+* External IdP token validation is limited to `api_ingress` and STS.
+* East-west requests require workload identity (mTLS) and an internal token.
+* SPIFFE/SVID provides workload identity transport; authorization is enforced by policy + token contents.
 
 ---
 
 ## Continuous monitoring, audit, and SIEM/SOAR integration (Required)
 
-Zero Trust requires continuous verification and strong auditability, not just “best-effort logs”.
-This section defines the minimum telemetry that the data plane and control plane MUST emit.
+Minimum telemetry requirements for data plane and control plane.
 
 ### Audit event model (minimum)
 
@@ -161,8 +184,9 @@ Every enforcement point (`api_ingress`, each module server interceptor, STS, Dir
 * `timestamp`
 * `trace_id` / `correlation_id`
 * `tenant_id` (`tid`)
-* `actor_subject` (`sub`) and `actor_type`
+* `actor_subject` and `actor_type` (from `SecurityCtx`; treat as potentially sensitive/PII depending on IdP subject format)
 * `peer_spiffe_id` (from mTLS) for internal calls
+* `caller_spiffe_id` (from internal token; MUST match `peer_spiffe_id` unless a future delegation extension is implemented)
 * `aud` (intended callee identity)
 * `operation` (HTTP method + route template, or gRPC full method)
 * `decision` (`allow|deny`)
@@ -187,7 +211,7 @@ Transport can be filebeat/agent, OTLP, syslog, or HTTP collector, but the schema
 The platform SHOULD alert on:
 
 * Spike in `deny` rate per service/tenant (possible misconfig or attack).
-* Repeated failures for `token.sub != peer_spiffe_id` (possible impersonation/lateral movement).
+* Repeated failures for `caller_spiffe_id != peer_spiffe_id` (possible impersonation/lateral movement).
 * High rate of unknown/rotated `kid` (key mismatch or attack).
 * Introspection errors/timeouts above threshold (IdP outage or DDoS).
 * Directory resolution anomalies (unexpected endpoint changes, frequent re-registrations).
@@ -243,7 +267,7 @@ Same logical roles, different primitives:
 
 * CA may be internal or cluster-managed (e.g. cert-manager).
 * Keys and bundles stored in Secrets or external KMS.
-* Directory and STS remain unchanged conceptually.
+* Directory and STS roles are unchanged.
 
 ### STS with IdP plugins
 
@@ -265,6 +289,28 @@ STS is strictly control plane:
 * No refresh tokens
 * No user sessions
 
+#### External IdP vs STS (normative distinction)
+
+**External IdP and STS are different roles.**
+
+**External IdP**
+
+* Authenticates a human user or an external service.
+* Issues an **external token** (JWT or opaque access token).
+* Does not know internal service topology, internal SPIFFE IDs, or internal authorization semantics.
+
+**STS**
+
+* Does **not** authenticate the user.
+* Is **not** the source of identity.
+* Performs **token exchange + downscoping** for internal use.
+* Issues an **internal capability token** (short-lived, audience-bound, internal-only semantics).
+
+Normative statement:
+
+> STS is not the source of identity.  
+> STS performs token exchange and issues internal authorization artifacts.
+
 ### STS API sketch (Draft)
 
 The following STS APIs are recommended to make responsibilities explicit and implementation testable.
@@ -276,7 +322,7 @@ Called by: `api_ingress` only (boundary). Auth: mTLS (SPIFFE ID).
 Request (draft):
 
 * `external_token`: bearer token string
-* `requested_audience`: logical service id or SPIFFE ID (optional; can be used for policy)
+* `requested_audience`: callee SPIFFE ID (optional; can be used for policy)
 * `trace_id` (optional; if not provided, STS generates one)
 
 Response (draft):
@@ -298,9 +344,16 @@ Called by: `api_ingress` and internal modules. Auth: mTLS (SPIFFE ID).
 
 Request (draft):
 
-* `aud`: callee logical service id or SPIFFE ID
-* `security_ctx`: canonical `SecurityCtx` (for boundary) OR a `ctx_ref`/`ctx_fingerprint` (optional optimization)
+* `aud`: callee SPIFFE ID
+* `ctx_ref` / `ctx_fingerprint`: reference to a previously exchanged/derived `SecurityCtx` (for internal calls)
+* `security_ctx`: canonical `SecurityCtx` (boundary-only: `api_ingress` caller)
 * `external_exp` (optional; if provided, STS bounds TTL; if absent, STS uses policy_max_ttl only)
+
+Rules:
+
+* Internal modules MUST NOT submit arbitrary `security_ctx` blobs for minting.
+* For internal mint calls, STS MUST derive mint input from the caller’s authenticated context (caller-presented internal token / previously exchanged context) and MUST accept only `ctx_ref` / `ctx_fingerprint` (or equivalent safe reference).
+* For boundary mint calls where `security_ctx` is accepted, STS MUST validate schema, canonicalization, and size limits, and MUST enforce consistency with caller authorization.
 
 Response (draft):
 
@@ -339,11 +392,37 @@ Normative split of responsibilities:
 This system MUST NOT accept, store, forward, or manage refresh tokens.
 Refresh token lifecycle (storage, rotation, theft protection) is owned by the external client and/or external IdP SDK/agent.
 
+---
+
+## UI / Browser session lifecycle (Required)
+
+UI request/session requirements.
+
+### Token types and boundaries
+
+* **UI refresh token** (browser/app session): owned by the external client + external IdP SDK/agent. This platform MUST NOT see it.
+* **UI access token**: short-lived external token presented to `api_ingress` at the boundary.
+* **Internal token**: short-lived token minted by STS for internal service-to-service calls and for `api_ingress` → modules.
+
+### Where `SecurityCtx` comes from for a user request
+
+For a user-initiated request, STS maps the external token (JWT claims or introspection response) into `SecurityCtx`, plus boundary-generated trace/audit fields. Modules reconstruct `SecurityCtx` from the internal token on every hop.
+
+### UI request lifecycle (informative)
+
+1. UI obtains/refreshes an **access token** from external IdP (using refresh token owned by UI/SDK).
+2. UI calls `api_ingress` with `Authorization: Bearer <external_access_token>`.
+3. `api_ingress` calls STS:
+   * `POST /v1/exchange` to validate/introspect and produce canonical `SecurityCtx` (or a derived representation).
+   * `POST /v1/mint` to mint internal token(s) for the target audience(s).
+4. `api_ingress` routes to internal module over authenticated channel and presents the internal token.
+5. If the UI access token expires/revokes:
+   * `api_ingress` fails closed (via STS deny).
+   * UI obtains a new access token from IdP and retries.
+
 #### What happens when the external access token expires/revokes (Required)
 
-If the external access token expires or is revoked, the system cannot “self-heal” inside the boundary because external refresh is out of scope.
-
-Normative behavior:
+If the external access token expires or is revoked:
 
 * `api_ingress` MUST reject requests with an expired/revoked external token (fail closed).
 * STS MUST refuse to mint internal tokens derived from an expired/revoked external token.
@@ -356,7 +435,12 @@ Expected client behavior (informative):
 
 TBD (design choice for future iterations):
 
-* Long-running/background operations that outlive a single external access token need an explicit delegation model (e.g., job tokens, workload principals, or re-auth at checkpoints). This is intentionally not specified here.
+Long-running operations:
+
+* Internal tokens MUST NOT be treated as a user session mechanism.
+* A long-running operation that outlives a single external access token MUST use either:
+  * re-auth at checkpoints (client provides a fresh external token), or
+  * a separate non-user principal/token explicitly modeled and authorized (e.g., job/workload principal).
 
 #### JWT validation requirements (normative)
 
@@ -416,9 +500,34 @@ Mapping rules:
 
 ### Transport requirements
 
-* All east-west traffic MUST use mTLS.
+All east-west traffic MUST be authenticated. Whether this is **mTLS** or **local-only authenticated IPC** depends on the deployment model (see Deployment models matrix below).
+
+Normative baseline:
+
+* If traffic can traverse a network namespace boundary (pod-to-pod, host-to-host, cross-node), **mTLS MUST be used**.
+* If the channel is local-only IPC with strong OS access control (UDS / named pipes) and both ends are within the same host trust boundary, **mTLS MAY be replaced** by process trust + short-lived internal tokens, but only if the threat model for that deployment accepts this tradeoff.
+
 * Trust is established via trust bundle, not via network topology.
 * Workload API MUST be local-only IPC (UDS / named pipes) and never exposed as a network service.
+
+---
+
+## Deployment models and trust boundaries (Required)
+
+Components MAY be co-located or separated. Channel security requirements depend on deployment model.
+
+### Deployment matrix (baseline)
+
+| Deployment model | Processes | Typical channels | Is the channel network-hostile? | East-west authN | Notes |
+|---|---:|---|---|---|---|
+| Single process (dev / smallest on-prem) | 1 | in-memory calls | No | process trust + internal token checks (optional) | Useful for dev; weakest isolation |
+| Multi-process, same host (on-prem) | 2+ | UDS / named pipes (preferred) or localhost TCP | “Mostly” (host-local) | mTLS recommended on TCP; optional on strict IPC | Use OS ACLs + hardening; still enforce tokens |
+| Kubernetes pods (in-cluster) | 2+ per pod / multiple pods | pod-to-pod over network | Yes | mTLS required | Cross-namespace/cross-node must assume hostile network |
+| Cross-node / cross-host (on-prem cluster) | 2+ | network | Yes | mTLS required | Required for lateral movement resistance |
+
+Normative rule:
+
+* If any hop uses TCP beyond strict local-only IPC, treat it as hostile and require mTLS (trust bundle + SPIFFE ID).
 
 ---
 
@@ -451,6 +560,36 @@ From that point onward, module identity is proven only via mTLS.
 
 ---
 
+## Bootstrap and first trust establishment (Required)
+
+First trust establishment requirements.
+
+### Boot token: who issues it and how it is delivered
+
+* Issuer: **Master Host / Module Orchestrator** (control plane).
+* Delivery: out-of-band at module launch time (e.g., process args/env, inherited handle, or OS-protected IPC). It MUST NOT be logged or written to plaintext files.
+* Trust basis: the Master Host is already trusted by the operator and is anchored in OS protected storage (see Key storage requirements).
+
+### First-start scenario (informative)
+
+1. Operator installs/starts Master Host.
+2. Master Host loads or generates long-lived control plane keys in OS protected storage (CA key, STS signing keys).
+3. When launching a new module instance, Master Host creates a boot token bound to:
+   * `module_name`, `module_instance_id`, `issued_at`, `nonce`, and TTL.
+4. Module generates a local keypair and calls the local Workload API (IPC) with CSR + boot token.
+5. CA validates boot token and issues X.509 SVID + chain + trust bundle to that module instance.
+6. Module registers itself in Directory using its newly issued identity.
+
+* After bootstrap, the boot token MUST NOT be reused. Ongoing identity proof is by workload identity (SVID) and request-scoped internal tokens.
+
+### External token: who issues it
+
+* Issuer: **external IdP** (out of scope for this system).
+* Delivery: obtained by the external client (UI/app/service) via external IdP flows.
+* The external token is untrusted input at the boundary and is validated only via STS plugins invoked by `api_ingress`.
+
+---
+
 ## Canonical Security Context
 
 ### `SecurityCtx` (conceptual)
@@ -475,6 +614,7 @@ UNDER DESIGN (tenant model):
 * The internal token MUST carry a single **effective tenant** (`tid`) that scopes the current request for routing, isolation, and auditing.
 * The authorization `scope` may represent a *set* of tenants/resources derived from the effective tenant (e.g., tenant hierarchy).
   This derivation is intended to be resolved by a dedicated **Tenant Resolver** service during STS exchange/mint.
+  If a Tenant Resolver participates in STS exchange/mint, it becomes an authorization input and MUST follow the same transport/auth/audit/fail-closed requirements as STS.
 
 TODO: Specify whether multi-tenant operations are allowed per request. Default assumption: requests are evaluated within one effective `tid`.
 
@@ -501,19 +641,24 @@ Internal token is minted by STS and consumed by modules and `api_ingress`.
 ### Required claims
 
 * `iss`: STS issuer id
-* `sub`: caller workload identity (caller SPIFFE ID) or canonical subject
-* `aud`: callee identity (module SPIFFE ID or module logical name)
+* `caller_spiffe_id`: caller workload identity (SPIFFE ID); MUST match `peer_spiffe_id` from mTLS on every hop
+* `aud`: callee workload identity (SPIFFE ID)
 * `exp`: short TTL (minutes, not hours)
 * `iat`: issued-at
 * `jti`: unique id (supports replay detection if you add a cache)
 * `tid`: effective tenant id for this request (Required)
 * `scp` or `roles`: authorization inputs
-* `ctx` (recommended): canonicalized SecurityCtx payload (or a minimal subset required for authZ)
+* `ctx`: canonicalized SecurityCtx payload (or a minimal subset required for authZ); MUST include `subject` (actor subject) and `actor_type`
 
 Notes:
 
+* `caller_spiffe_id` exists only to bind the token to the transport workload identity and to disambiguate audit fields; it is not an alternative identity source.
 * If you embed `ctx`, you may optionally include `ctx_hash` for debugging or integrity checks.
 * Token format may be JWT or PASETO, but requirements above remain the same.
+
+Invariant:
+
+* `tid` MUST equal `ctx.tenant_id`. A mismatch MUST be treated as an invalid token.
 
 UNDER DESIGN (scope expansion):
 
@@ -566,10 +711,16 @@ STS accepts token-minting requests only via mTLS:
 
 ### Token binding to mTLS (Recommended)
 
-To reduce token theft/forwarding risk, bind token to the mTLS channel:
+Token binding baseline:
 
-* Include a confirmation claim derived from the client certificate public key (or its hash).
-* Server validates that presented client cert matches token binding.
+* Include a `cnf` claim containing a SHA-256 thumbprint of the client certificate (base64url, no padding).
+* Claim shape:
+  * `cnf: { "x5t#S256": "<b64url(sha256(DER(cert)))>" }`
+* Server verification:
+  * Compute `sha256(DER(client_cert))` from the presented mTLS client certificate.
+  * Compare to `cnf["x5t#S256"]`.
+  * On mismatch, deny with reason code `TOKEN_BINDING_FAIL`.
+* If the client certificate rotates, previously minted bound tokens become invalid and clients MUST mint new tokens.
 
 If you do not implement binding, compensate with:
 
@@ -602,17 +753,20 @@ For every inbound request (REST or gRPC), server interceptor MUST:
 2. Validate internal token:
 
    * verify signature via `kid`
+     * on unknown `kid`, verifier MUST attempt a single bounded JWKS refresh; if still unknown, deny with `BAD_TOKEN_SIG`
    * verify `iss`, `aud`, `exp`, `iat`
+   * verify `aud` equals the server SPIFFE ID (from the server SVID)
 
 3. Bind token identity to mTLS identity:
 
-   * verify that `token.sub` equals `peer_spiffe_id` (or is within an explicitly allowed set)
+   * verify that `token.caller_spiffe_id` equals `peer_spiffe_id`
 
 4. If token binding is enabled:
 
    * verify token confirmation claim matches presented client certificate
 
 5. Reconstruct canonical `SecurityCtx` from token and store in task-local for request scope.
+   * verify `tid == ctx.tenant_id`
 
 Fail-closed rule:
 
@@ -626,20 +780,25 @@ fn handle_inbound(request):
   peer_spiffe_id = extract_uri_san_spiffe_id(peer_cert)
   assert(peer_spiffe_id is not None) else deny("NO_PEER_SPIFFE_ID")
 
+  server_cert = tls.local_certificate()
+  server_spiffe_id = extract_uri_san_spiffe_id(server_cert)
+  assert(server_spiffe_id is not None) else deny("NO_SERVER_SPIFFE_ID")
+
   token = parse_bearer_token(request.headers["Authorization"])
   claims = verify_internal_token(token, jwks_cache)
   assert(claims.iss == STS_ISSUER) else deny("BAD_ISS")
-  assert(claims.aud == THIS_SERVICE_ID) else deny("BAD_AUD")
+  assert(claims.aud == server_spiffe_id) else deny("BAD_AUD")
   assert(now < claims.exp) else deny("TOKEN_EXPIRED")
 
-  // bind token identity to channel identity
-  assert(claims.sub == peer_spiffe_id or is_allowed_delegate(peer_spiffe_id, claims.sub)) else deny("SUB_PEER_MISMATCH")
+  // bind token caller identity to channel identity
+  assert(claims.caller_spiffe_id == peer_spiffe_id) else deny("CALLER_SPIFFE_MISMATCH")
 
   if token_binding_enabled:
     assert(verify_confirmation_claim(claims, peer_cert)) else deny("TOKEN_BINDING_FAIL")
 
   ctx = reconstruct_security_ctx(claims.ctx)
   assert(ctx.tenant_id is not None) else deny("NO_TENANT")
+  assert(ctx.tenant_id == claims.tid) else deny("TID_CTX_MISMATCH")
 
   // module-specific authorization
   assert(authorize(ctx, request.operation, request.resource)) else deny("NOT_AUTHZ")
@@ -657,6 +816,23 @@ Authentication answers “who are you”. Zero Trust requires “are you allowed
 
 * Policy evaluation is a control plane responsibility (STS or a dedicated Policy Engine).
 * Data plane enforces the decision per request using internal token contents and `SecurityCtx`.
+
+### Authorization decision points (Required)
+
+Decision points:
+
+* **Boundary (north-south)**:
+  * `api_ingress` is the Policy Enforcement Point (PEP).
+  * STS (or a dedicated policy engine behind it) is the decision and minting component that produces internal authorization artifacts (PDP-like role).
+* **East-west (service-to-service)**:
+  * each module server interceptor is a PEP for its own operations.
+  * the module authorizes operations based on `SecurityCtx` + request context, deny-by-default.
+
+Minimum decision inputs (per request):
+
+* transport identity: `peer_spiffe_id` (from mTLS, or from authenticated local IPC identity)
+* internal token claims: `iss`, `aud`, `exp`, `tid`, roles/entitlements, optional token binding
+* request context: method/route/RPC, resource identifiers, requested tenant routing, risk/context fields (if used)
 
 ### Hybrid authorization semantics (RBAC + entitlements) (Required)
 
@@ -762,13 +938,13 @@ Rule: “validated token” is not “authorized request”.
 1. gRPC client interceptor
 
    * Reads task-local `SecurityCtx`
-   * Requests an internal token from STS (audience = callee)
+   * Requests an internal token from STS (audience = callee SPIFFE ID)
    * Attaches `Authorization: Bearer <internal-token>` as gRPC metadata
 
 2. REST client middleware
 
    * Reads task-local `SecurityCtx`
-   * Requests an internal token from STS (audience = callee)
+   * Requests an internal token from STS (audience = callee SPIFFE ID)
    * Attaches `Authorization: Bearer <internal-token>` as HTTP header
 
 Token minting should be cached per `(aud, ctx_fingerprint)` until near expiry to avoid hammering STS.
@@ -787,7 +963,7 @@ TODO: Specify concrete caching parameters:
 
    * Validate peer mTLS identity (trust bundle, extract peer SPIFFE ID)
    * Validate internal token (`kid`, signature, `iss`, `aud`, `exp`, `iat`)
-   * Enforce `token.sub` equals peer SPIFFE ID (or allowed set)
+   * Enforce `token.caller_spiffe_id` equals peer SPIFFE ID
    * Apply token binding checks if enabled
    * Reconstruct canonical `SecurityCtx`
    * Store `SecurityCtx` in task-local storage for request scope
@@ -811,12 +987,52 @@ Directory is not “just service discovery”. It is an authorization input and 
 For each service endpoint:
 
 * `service_id` (logical name)
-* `spiffe_id` (expected identity)
+* `spiffe_id` (expected server identity; SPIFFE ID)
+* `owner_spiffe_id` (SPIFFE ID; required owner identity for the `service_id`)
 * `endpoints` (host:port, protocol)
 * `status` and `last_heartbeat` (optional but practical)
 * `allowed_callers` (optional, strongly recommended)
 
   * list of caller SPIFFE IDs or groups allowed to call this service
+
+### Ownership (Required)
+
+* Each `service_id` MUST have an `owner_spiffe_id`.
+* Only the owner MAY register, update, or revoke endpoints for that `service_id`, unless an operator role is used (see Revocation).
+* `owner_spiffe_id` MUST be provisioned by control plane configuration (or operator action) and MUST NOT be implicitly assigned by first registration in production.
+* In dev deployments, Directory MAY default `owner_spiffe_id` on first registration.
+
+### Register / update semantics (Required)
+
+* Registration MUST bind the entry to the registering module identity:
+  * Directory MUST set `spiffe_id` to the registering module’s peer SPIFFE ID from mTLS.
+* Update MUST be explicit:
+  * an update replaces the full endpoint set for the `service_id` (no implicit merge).
+  * add/remove MAY be implemented as separate operations; if implemented, operations MUST be auditable and MUST respect ownership checks.
+
+### Revocation (Required)
+
+* Directory MUST support revocation of a `service_id` registration.
+* A revoke operation MAY be performed by:
+  * `owner_spiffe_id`, or
+  * an operator role authorized by the control plane.
+* After revoke, `resolve` MUST return no endpoints for that `service_id` until re-registered.
+
+### Versioning and audit (Required)
+
+* Directory responses SHOULD include a monotonic `revision` and a `ttl`.
+* Directory MUST emit audit events for register/update/revoke with:
+  * `timestamp`, `trace_id`, `service_id`, `owner_spiffe_id`, `spiffe_id`, `endpoints` (or endpoint count), `revision`, `decision`, `reason_code`.
+
+### Client validation, caching, and mismatch behavior (Required)
+
+* Clients MUST pin the expected Directory SPIFFE ID and use mTLS for Directory access.
+* Clients MUST fail closed on:
+  * missing/expired cache and Directory unavailable, or
+  * mismatch between resolved `spiffe_id` and the server certificate SPIFFE ID on connection establishment.
+* Cache use:
+  * clients MAY use cached results until `ttl` expires;
+  * after `ttl` expiry, if Directory cannot be reached, clients MUST fail closed (no stale-while-revalidate for new connections).
 
 ### Directory write access (Required)
 
@@ -824,7 +1040,7 @@ Only authenticated modules may register:
 
 * module registration MUST be authenticated using the issued identity (mTLS).
 * registration MUST be restricted so a module can register only what it is allowed to register (service id constraints).
-* Directory SHOULD store `expected spiffe_id` as the registering module’s peer SPIFFE ID.
+* Directory MUST store `spiffe_id` as the registering module’s peer SPIFFE ID.
 
 ### Directory read access
 
@@ -837,8 +1053,9 @@ Only authenticated modules may register:
 
 TODO: Specify concrete API endpoints and a stable schema. Recommended minimum:
 
-* `GET /v1/resolve?service_id=<id>` → `{ service_id, spiffe_id, endpoints[], ttl }`
-* `POST /v1/register` (mTLS only) → registers `{ service_id, endpoint, metadata }` bound to the caller SPIFFE ID
+* `GET /v1/resolve?service_id=<id>` → `{ service_id, spiffe_id, endpoints[], ttl, revision }`
+* `POST /v1/register` (mTLS only) → registers or replaces `{ service_id, endpoints[], metadata }` bound to the caller SPIFFE ID; ownership enforced
+* `POST /v1/revoke` (mTLS only) → revokes `{ service_id }`; ownership/operator enforcement
 
 Required client behavior:
 
@@ -887,14 +1104,14 @@ Practical approach:
 
 Optional incident-response deny-list:
 
-* deny `sub` (caller SPIFFE ID) or `jti` in data plane cache for bounded time
+* deny `caller_spiffe_id` or `jti` in data plane cache for bounded time
 * use only for incident response, not as primary mechanism
 
 ---
 
 ## Incident response and revocation playbooks (Required)
 
-This section describes the minimum “break glass” actions and real-time controls when compromise is suspected.
+Minimum “break glass” actions and real-time controls when compromise is suspected.
 
 ### Real-time containment levers (minimum)
 
@@ -905,7 +1122,7 @@ This section describes the minimum “break glass” actions and real-time contr
 2. **Internal token abuse**
    * Data plane SHOULD support a bounded denylist keyed by:
      * `jti` (replay/abuse of a single token), and/or
-     * `sub` (compromised caller identity)
+     * `caller_spiffe_id` (compromised caller identity)
    * Denylist TTL MUST be bounded (minutes) and used for incident response only.
 
 3. **STS signing key compromise**
@@ -920,9 +1137,9 @@ This section describes the minimum “break glass” actions and real-time contr
 
 ### Detection-to-response workflow (example)
 
-* Detect anomaly (SIEM alert): repeated `token.sub != peer_spiffe_id`, token replay (`jti` reuse), or unexpected audience usage.
+* Detect anomaly (SIEM alert): repeated `caller_spiffe_id != peer_spiffe_id`, token replay (`jti` reuse), or unexpected audience usage.
 * Contain:
-  * add `jti` or `sub` to temporary denylist,
+  * add `jti` or `caller_spiffe_id` to temporary denylist,
   * disable affected `kid` if applicable,
   * revoke external token in IdP if available.
 * Recover:
@@ -975,7 +1192,9 @@ To make fail-closed behavior consistent across REST and gRPC, use stable reason 
 | Bad token signature / unknown `kid` | `BAD_TOKEN_SIG` | 401 | `UNAUTHENTICATED` | trigger JWKS refresh on unknown `kid` |
 | Token expired | `TOKEN_EXPIRED` | 401 | `UNAUTHENTICATED` | client should mint fresh token |
 | Bad issuer/audience | `BAD_ISS_OR_AUD` | 401 | `UNAUTHENTICATED` | misroute or attack |
-| `sub` != `peer_spiffe_id` | `SUB_PEER_MISMATCH` | 401 | `UNAUTHENTICATED` | lateral movement attempt |
+| `tid` != `ctx.tenant_id` | `TID_CTX_MISMATCH` | 401 | `UNAUTHENTICATED` | token tampering or bug |
+| `caller_spiffe_id` != `peer_spiffe_id` | `CALLER_SPIFFE_MISMATCH` | 401 | `UNAUTHENTICATED` | lateral movement attempt |
+| Token binding failed | `TOKEN_BINDING_FAIL` | 401 | `UNAUTHENTICATED` | `cnf` mismatch or missing when required |
 | AuthZ denied | `NOT_AUTHZ` | 403 | `PERMISSION_DENIED` | include `trace_id` for debugging |
 | STS down (cannot mint) | `STS_UNAVAILABLE` | 503 | `UNAVAILABLE` | do not skip token |
 | Directory down (cannot resolve) | `DIR_UNAVAILABLE` | 503 | `UNAVAILABLE` | use cached mapping only within TTL |
@@ -992,7 +1211,7 @@ sequenceDiagram
   autonumber
   participant OS as OS Protected Storage
   participant MH as Master Host
-  participant CA as CA + Directory
+  participant CA as CA+Directory (control plane)
   participant STS as STS
   participant AG as API Ingress
 
@@ -1014,8 +1233,9 @@ sequenceDiagram
   participant MH as Master Host
   participant MOD as OoP Module
   participant WAPI as Local Workload API
-  participant CA as CA + Directory
+  participant CA as CA+Directory (control plane)
   participant DIR as Directory
+  %% Note: CA and DIR may be co-located on-prem; the API endpoints remain distinct in this diagram.
 
   MH->>MOD: Launch module with one-time boot token
   MOD->>MOD: Generate local keypair
@@ -1042,7 +1262,7 @@ sequenceDiagram
 
   C->>AG: REST request + external token
   AG->>STS: Exchange external token -> SecurityCtx (validate/introspect/map)
-  AG->>STS: Mint internal token (aud=M1, bound to external_exp)
+  AG->>STS: Mint internal token (aud=spiffe://<trust-domain>/workload/m1, bound to external_exp)
   AG->>DIR: Resolve M1 endpoint + expected SPIFFE ID
   AG->>M1: REST/HTTP2 + mTLS + internal token
   M1->>M1: Validate peer identity + internal token + authZ
@@ -1063,7 +1283,7 @@ sequenceDiagram
   participant M2 as OoP Module 2
 
   M1->>DIR: Resolve M2 endpoint + expected SPIFFE ID
-  M1->>STS: Mint internal token (aud=M2)
+  M1->>STS: Mint internal token (aud=spiffe://<trust-domain>/workload/m2)
   M1->>M2: REST/HTTP2 + mTLS + internal token
   M2->>M2: Validate peer SPIFFE-light ID
   M2->>M2: Validate internal token
@@ -1084,7 +1304,7 @@ sequenceDiagram
   participant M2 as OoP Module 2
 
   M1->>DIR: Resolve gRPC endpoint + expected SPIFFE ID
-  M1->>STS: Mint internal token (aud=M2)
+  M1->>STS: Mint internal token (aud=spiffe://<trust-domain>/workload/m2)
   M1->>M2: gRPC + mTLS + metadata token
   M2->>M2: Validate peer identity and token
   M2->>M2: Authorize RPC method
@@ -1109,7 +1329,7 @@ sequenceDiagram
 
 ## Future compatibility: SPIRE and service mesh
 
-This architecture is intentionally SPIFFE-aligned:
+SPIFFE-aligned:
 
 * SPIFFE-shaped IDs
 * Trust bundles as first-class artifacts ([SpiFFE][6])
@@ -1120,6 +1340,49 @@ Migration path:
 * Replace SPIFFE-light issuer with SPIRE ([SpiFFE][5])
 * Replace local Workload API with SPIRE Agent Workload API
 * Keep STS, internal tokens, interceptors, and policies unchanged
+
+---
+
+## Appendix: Why STS if we already have mTLS? (Recommended)
+
+System uses workload identity (mTLS) and internal tokens.
+
+### What mTLS gives you
+
+* Strong cryptographic workload identity for the caller (`peer_spiffe_id`).
+* Channel confidentiality/integrity on hostile networks.
+
+mTLS alone does **not** provide:
+
+* user/tenant context for user-initiated requests,
+* downscoped, audience-bound authorization semantics,
+* isolation from external IdP token formats and validation methods,
+* uniform authZ inputs across protocols and services without coupling every service to every IdP.
+
+### What STS adds (why it is not “just another JWT”)
+
+STS provides:
+
+* **token downscoping** (strict `aud`, bounded TTL, optional capability semantics),
+* **internal-only semantics** (stable, versioned `SecurityCtx` mapping; minimal claim set),
+* **format isolation** (opaque vs JWT external tokens stop at the boundary; internal services stay consistent),
+* **centralized revocation propagation when available** (e.g., opaque token introspection),
+* improved auditability (stable reason codes and canonical context).
+
+### Alternative design (valid): mTLS identity + pass-through external token
+
+An alternative is to use mTLS for workload identity and forward the external token deeper until an authorization point.
+
+Tradeoffs:
+
+* Pros: fewer moving parts; potentially lower latency on some paths.
+* Cons (for this architecture):
+  * internal services must understand external IdP tokens or depend on a shared validation library and IdP config,
+  * revocation/introspection and claim mapping leaks inward,
+  * coupling increases across tenants/IdPs and across protocol boundaries,
+  * harder to keep a stable, minimal internal authorization context.
+
+STS keeps external identity formats at the boundary and issues downscoped, internal-only authorization artifacts.
 
 ---
 
