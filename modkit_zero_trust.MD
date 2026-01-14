@@ -10,6 +10,8 @@ This document describes the security and communication architecture for a modula
 
 The design explicitly separates control plane and data plane responsibilities.
 
+SPIFFE is used as a standard format for workload identity (naming, issuance, and validation), not as a new security concept.
+
 This design is aligned with Zero Trust principles in NIST SP 800-207 (focus on identity, continuous verification, and removing network location trust). ([NIST Publications][2])
 
 ---
@@ -24,14 +26,30 @@ This design is aligned with Zero Trust principles in NIST SP 800-207 (focus on i
 
 ## Glossary
 
+* **SPIFFE**: a set of standards for workload identity across heterogeneous environments (naming via SPIFFE IDs, issuance/rotation of SVIDs, and a Workload API contract).
 * **SPIFFE ID**: URI identifier for a workload identity (`spiffe://<trust-domain>/<path>`). ([SpiFFE][3])
 * **SVID**: SPIFFE Verifiable Identity Document. In practice here: X.509 certificate used for mTLS. ([SpiFFE][4])
 * **Trust domain**: administrative boundary for identities and trust bundles. ([SpiFFE][3])
 * **SPIFFE-light**: SPIFFE-shaped identities + Workload API abstraction without running SPIRE on-prem.
-* **STS**: Security Token Service that normalizes external identity into canonical `SecurityCtx` and mints internal tokens.
+* **External IdP**: an external Identity Provider that performs end-user login and issues external access tokens. External IdP behavior and session management are out of scope.
+* **STS**: internal Security Token Service that validates and normalizes external access tokens into canonical `SecurityCtx` and mints short-lived internal tokens for services.
 * **Directory**: service discovery plus expected service identity (SPIFFE ID) for endpoints.
 * **Control plane**: issues identities, policies, keys; authoritative state.
 * **Data plane**: executes per-request enforcement; stateless and replaceable.
+
+---
+
+## STS vs External IdP (Clarification)
+
+STS is not an Identity Provider (IdP). It exists inside this system boundary and is used to:
+
+* validate external access tokens presented at the boundary,
+* normalize external identity into a canonical `SecurityCtx`, and
+* mint short-lived internal tokens scoped to internal audiences.
+
+STS MUST NOT implement or assume responsibility for end-user login flows, refresh tokens, user sessions, browser cookies, or UI.
+
+External tokens are minted by external IdPs (out of scope). Boot tokens are minted by the control plane (in scope).
 
 ---
 
@@ -104,6 +122,9 @@ Responsibilities:
 On-prem note:
 For on-prem deployments, CA + Directory + STS may be implemented together inside the Module Orchestrator to reduce footprint. These remain logically separate control-plane responsibilities.
 
+On-prem practicality note (required):
+The recommended default on-prem deployment SHOULD run control plane components co-located in a single control-plane process (logical separation only). Control plane components MAY be physically split into multiple processes only when needed for scaling or hardening. If physically split, all inter-component communication MUST use authenticated and integrity-protected transports appropriate to the topology (mTLS for network paths, or OS-authenticated local IPC for same-host paths).
+
 ---
 
 ### Data Plane (executes per request)
@@ -112,7 +133,7 @@ The data plane is stateless, horizontally scalable, and replaceable.
 
 Components:
 
-* `api_ingress` (API gateway)
+* API Gateway (`api_gateway`)
 * OoP modules (REST/gRPC servers and clients)
 * mTLS connections
 * REST and gRPC request handling
@@ -126,9 +147,45 @@ Responsibilities:
 * Observability (metrics, logs, tracing)
 
 Important:
-`api_ingress` is intentionally a pure data plane component. It enforces decisions produced by the control plane but does not own identity, policy, or lifecycle state.
+API Gateway (`api_gateway`) is intentionally a pure data plane component. It enforces decisions produced by the control plane but does not own identity, policy, or lifecycle state.
 
 ---
+
+## Deployment topologies and trust boundaries
+
+This design supports multiple deployment topologies. The trust boundary and allowed transports depend on whether components share a host.
+
+### On-prem: same host mode
+
+Definition:
+
+* Control plane and modules run on the same OS host.
+
+Requirements:
+
+* East-west calls between modules SHOULD use mTLS when routed over the network stack.
+* For same-host process boundaries, local IPC transports (Unix domain sockets, Windows named pipes) MAY be used as an alternative to mTLS if the server enforces OS-level ACLs and verifies peer credentials. The resulting caller identity MUST still be represented as a SPIFFE ID for authorization, auditing, and Directory policy.
+
+### On-prem: multi-host mode
+
+Definition:
+
+* Control plane and/or modules run on different hosts over a network.
+
+Requirements:
+
+* All inter-process communication that crosses hosts MUST use mTLS with SPIFFE-shaped identities.
+
+### Kubernetes: pod-to-pod mode
+
+Definition:
+
+* Control plane and modules run as pods in a Kubernetes cluster.
+
+Requirements:
+
+* All pod-to-pod (and node-to-node) communication MUST use mTLS with SPIFFE-shaped identities.
+* Bootstrap and enrollment MUST follow the Kubernetes bootstrapping requirements in this spec.
 
 ## Why this design works
 
@@ -136,7 +193,7 @@ Important:
    Services are discovered via Directory. Trust is established cryptographically (mTLS + tokens), not via IPs or DNS.
 
 2. External token formats stop at the edge
-   Only `api_ingress` and STS understand external IdP tokens. Internal services see a single canonical security model.
+   Only API Gateway (`api_gateway`) and STS understand external IdP tokens. Internal services see a single canonical security model.
 
 3. Zero-trust east-west without a gateway bottleneck
    Module-to-module traffic goes direct, but every request is authenticated and authorized.
@@ -156,13 +213,13 @@ This section defines the minimum telemetry that the data plane and control plane
 
 ### Audit event model (minimum)
 
-Every enforcement point (`api_ingress`, each module server interceptor, STS, Directory) MUST emit structured audit events with:
+Every enforcement point (API Gateway (`api_gateway`), each module server interceptor, STS, Directory) MUST emit structured audit events with:
 
 * `timestamp`
 * `trace_id` / `correlation_id`
 * `tenant_id` (`tid`)
 * `actor_subject` (`sub`) and `actor_type`
-* `peer_spiffe_id` (from mTLS) for internal calls
+* `peer_spiffe_id` (from mTLS, or from OS-authenticated local IPC mapping) for internal calls
 * `caller_spiffe_id` (token claim)
 * `aud` (intended callee identity)
 * `operation` (HTTP method + route template, or gRPC full method)
@@ -208,6 +265,8 @@ In this design, SPIFFE-light ID means a SPIFFE-shaped workload identity without 
 * It is never resolved via DNS.
 * Resolution is done via Directory.
 
+SPIFFE provides standardization for workload identity across environments, not a new security model. This design uses SPIFFE IDs and SVIDs as interoperable identity primitives.
+
 SPIRE remains a future upgrade path. ([SpiFFE][5])
 
 ---
@@ -219,7 +278,7 @@ SPIRE remains a future upgrade path. ([SpiFFE][5])
 Control plane entry point:
 
 * Hosts STS, CA (SPIFFE-light), Directory
-* Starts and configures `api_ingress`
+* Starts and configures API Gateway (`api_gateway`)
 * Manages protected storage for long-lived keys
 
 #### Key storage (on-prem) (Required)
@@ -272,7 +331,7 @@ The following STS APIs are recommended to make responsibilities explicit and imp
 
 #### `POST /v1/exchange` (external token → `SecurityCtx`) (Draft)
 
-Called by: `api_ingress` only (boundary). Auth: mTLS (SPIFFE ID).
+Called by: API Gateway (`api_gateway`) only (boundary). Auth: mTLS (SPIFFE ID) for network paths, or OS-authenticated local IPC for same host paths.
 
 Request (draft):
 
@@ -295,26 +354,26 @@ TODO: Define exact JSON schema and stable error codes for this endpoint.
 
 #### `POST /v1/mint` (mint internal token for `aud`) (Draft)
 
-Called by: `api_ingress` and internal modules. Auth: mTLS (SPIFFE ID).
+Called by: API Gateway (`api_gateway`) and internal modules. Auth: mTLS (SPIFFE ID) for network paths, or OS-authenticated local IPC for same host paths.
 
 Request (draft):
 
 * `aud`: callee logical service id or SPIFFE ID (input; STS resolves to callee SPIFFE ID)
-* `security_ctx`: canonical `SecurityCtx` (boundary: `api_ingress` only)
+* `security_ctx`: canonical `SecurityCtx` (boundary: API Gateway (`api_gateway`) only)
 * `external_exp` (optional; if provided, STS bounds TTL; if absent, STS uses policy_max_ttl only)
 
 STS MUST set the minted internal token `aud` claim to the callee SPIFFE ID (resolved from the request `aud` input).
 
 Boundary mint vs internal mint:
 
-* Boundary (`api_ingress`): MUST call `/v1/mint` using mTLS and `security_ctx` (derived from `/v1/exchange`), without requiring an existing internal token.
-* Internal modules: MUST call `/v1/mint` using mTLS AND an existing internal token in `Authorization: Bearer <internal-token>` as the context handle, and MUST NOT submit `security_ctx`.
+* Boundary (API Gateway (`api_gateway`)): MUST call `/v1/mint` using an authenticated channel (mTLS for network paths, or OS-authenticated local IPC for same host paths) and `security_ctx` (derived from `/v1/exchange`), without requiring an existing internal token.
+* Internal modules: MUST call `/v1/mint` using an authenticated channel (mTLS for network paths, or OS-authenticated local IPC for same host paths) AND an existing internal token in `Authorization: Bearer <internal-token>` as the context handle, and MUST NOT submit `security_ctx`.
 
 Internal (east-west) mint rule:
 
 * Internal modules MUST present an existing internal token as `Authorization: Bearer <internal-token>` when calling `/v1/mint`.
 * Internal modules MUST NOT submit `security_ctx`.
-* STS MUST validate the presented internal token and MUST verify the presented internal token `caller_spiffe_id` matches the STS-observed `peer_spiffe_id` from mTLS.
+* STS MUST validate the presented internal token and MUST verify the presented internal token `caller_spiffe_id` matches the STS-observed `peer_spiffe_id` from the authenticated channel.
 * STS MUST derive mint input (`sub`, `tid`, and `ctx`) from the presented internal token.
 
 Response (draft):
@@ -330,19 +389,19 @@ Errors (draft):
 
 ### External IdP token handling (Required)
 
-External identity is accepted **only at the boundary** (`api_ingress`) and normalized by STS plugins.
+External identity is accepted **only at the boundary** (API Gateway (`api_gateway`)) and normalized by STS plugins.
 Internal services and modules MUST NOT validate or accept external IdP tokens directly.
 
 Normative split of responsibilities:
 
-* `api_ingress` is the boundary enforcement point (PEP): it accepts the external access token and delegates **all** token validation/introspection/claim mapping to STS.
+* API Gateway (`api_gateway`) is the boundary enforcement point (PEP): it accepts the external access token and delegates **all** token validation/introspection/claim mapping to STS.
 * STS is the boundary decision + issuer component: it performs external validation + normalization and returns canonical `SecurityCtx` and/or minted internal tokens.
 
-`api_ingress` MAY perform only cheap syntactic checks (presence, size limits, basic format) for early rejection, but MUST NOT interpret external claims for authorization.
+API Gateway (`api_gateway`) MAY perform only cheap syntactic checks (presence, size limits, basic format) for early rejection, but MUST NOT interpret external claims for authorization.
 
 #### Supported external token types
 
-`api_ingress` and STS plugins MUST support the following (your environment may enable a subset):
+API Gateway (`api_gateway`) and STS plugins MUST support the following (your environment may enable a subset):
 
 1. **OIDC/OAuth2 access token as JWT** (signed): offline validation using IdP JWKS.
 2. **OAuth2 access token as opaque string**: online validation via IdP **introspection**.
@@ -358,14 +417,14 @@ If the external access token expires or is revoked, the system cannot self-heal 
 
 Normative behavior:
 
-* `api_ingress` MUST reject requests with an expired/revoked external token (fail closed).
+* API Gateway (`api_gateway`) MUST reject requests with an expired/revoked external token (fail closed).
 * STS MUST refuse to mint internal tokens derived from an expired/revoked external token.
 * Internal modules MUST NOT attempt to contact the external IdP and MUST NOT attempt to refresh external tokens.
 
 Expected client behavior (informative):
 
 * The external client obtains a fresh access token from its IdP (typically via refresh held by the client/SDK).
-* The client retries the request with the new access token; `api_ingress` normalizes it and mints new internal tokens as needed.
+* The client retries the request with the new access token; API Gateway (`api_gateway`) normalizes it and mints new internal tokens as needed.
 
 TBD (design choice for future iterations):
 
@@ -373,7 +432,7 @@ TBD (design choice for future iterations):
 
 #### JWT validation requirements (normative)
 
-When the external token is a JWT, the STS plugin (invoked by `api_ingress`) MUST:
+When the external token is a JWT, the STS plugin (invoked by API Gateway (`api_gateway`)) MUST:
 
 * Verify signature against IdP JWKS (`kid` resolution, bounded cache).
 * Enforce an allow-list of acceptable algorithms (reject `none` and unexpected `alg`).
@@ -419,9 +478,19 @@ Mapping rules:
 
 ---
 
+## Why internal tokens exist in addition to mTLS
+
+The design uses both mTLS and internal tokens because they mitigate different threats:
+
+* mTLS authenticates the workload and channel identity (which workload is calling, and that the channel is protected).
+* Internal token carries end-user or tenant delegation (`SecurityCtx`) end-to-end across hops, without relying on external token formats inside the boundary.
+* Internal token provides downscoping (strict `aud`, short TTL), consistent authorization inputs across protocols, and better audit correlation (`tid`, `sub`, `jti`, `caller_spiffe_id`).
+* Internal tokens enable policy changes and revocation checks via STS without propagating external tokens internally.
+* This reduces blast radius if a module is compromised, because compromised modules cannot mint broader tokens, and stolen tokens are scoped and short-lived.
+
 ## Internal token format and rules (Required)
 
-Internal token is minted by STS and consumed by modules and `api_ingress`.
+Internal token is minted by STS and consumed by modules and API Gateway (`api_gateway`).
 
 ### Required claims
 
@@ -488,10 +557,10 @@ Operational note:
 
 ### STS caller authentication (Required)
 
-STS accepts token-minting requests only via mTLS:
+STS accepts token-minting requests only via an authenticated channel:
 
-* STS MUST require mTLS.
-* STS MUST identify caller by SPIFFE ID from peer certificate URI SAN.
+* STS MUST require an authenticated channel (mTLS for network paths, or OS-authenticated local IPC for same host paths).
+* STS MUST identify caller by SPIFFE ID from peer certificate URI SAN (mTLS) or from OS-authenticated local IPC mapping (same host).
 * STS MUST enforce policy defining which callers may mint tokens for which audiences (`aud`).
 
 ### Token binding to mTLS (Recommended)
@@ -520,7 +589,16 @@ If you do not implement binding, compensate with:
 
 ## East-west request validation (Required)
 
-Every internal request uses both mTLS and an internal token.
+Every internal request uses an authenticated channel identity (mTLS, or OS-authenticated local IPC in same host mode) and an internal token.
+
+Same-host transport note:
+In on-prem same host mode, implementations MAY use OS-authenticated local IPC (Unix domain sockets, Windows named pipes) for inter-process calls instead of mTLS. When local IPC is used:
+
+* The server MUST verify OS-level peer credentials.
+* The caller identity MUST be mapped to a SPIFFE ID.
+* Authorization and audit MUST use SPIFFE ID semantics exactly as with mTLS.
+
+Local IPC is an alternative transport, not an alternative security model. If the communication path can be reached over the network, mTLS MUST be used.
 
 ### Server-side checks (normative)
 
@@ -531,6 +609,8 @@ For every inbound request (REST or gRPC), server interceptor MUST:
    * validate chain to trust bundle
    * extract `peer_spiffe_id` from URI SAN
    * determine `server_spiffe_id` from local server certificate
+
+   If local IPC is used instead of mTLS, the server MUST perform an equivalent OS-level peer credential verification and MUST produce `peer_spiffe_id` consistent with the expected SPIFFE ID mapping.
 
 2. Validate internal token:
 
@@ -613,6 +693,11 @@ Authentication establishes who is calling. Authorization determines whether the 
 * Policy evaluation is a control plane responsibility (STS or a dedicated Policy Engine).
 * Data plane enforces the decision per request using internal token contents and `SecurityCtx`.
 
+Role clarity (normative):
+
+* STS and/or a dedicated Policy Engine is the policy decision point (PDP) for boundary normalization and token mint authorization.
+* API Gateway (`api_gateway`) and module interceptors are policy enforcement points (PEPs): they enforce allow/deny outcomes and per-operation authorization.
+
 ### Hybrid authorization semantics (RBAC + entitlements) (Required)
 
 This design assumes a hybrid model:
@@ -649,7 +734,7 @@ Evaluation inputs per request:
 
 Tenant isolation MUST be enforced at multiple layers:
 
-* `api_ingress` MUST prevent cross-tenant routing based on resolved `tenant_id`.
+* API Gateway (`api_gateway`) MUST prevent cross-tenant routing based on resolved `tenant_id`.
 * Every module MUST validate that any resource access is within `SecurityCtx.tenant_id` (and/or `resource_scope`) before performing the operation.
 
 #### Context-aware decisions (optional, but supported)
@@ -694,7 +779,7 @@ Pick one and document it clearly in code and schemas:
 
 ### Required enforcement points
 
-* `api_ingress` must enforce:
+* API Gateway (`api_gateway`) must enforce:
 
   * tenant boundary (no cross-tenant routing),
   * global quotas/rate limits,
@@ -751,7 +836,7 @@ TODO: Specify concrete caching parameters:
 
 4. External tokens are accepted only at the boundary
 
-   * External tokens are validated only in `api_ingress`
+   * External tokens are validated only in API Gateway (`api_gateway`)
    * Internal services never accept external IdP tokens
    * Everything inside uses canonical internal tokens
 
@@ -760,6 +845,8 @@ TODO: Specify concrete caching parameters:
 ## Directory requirements (security-critical)
 
 Directory is not just service discovery. It is an authorization input and must be protected accordingly.
+
+If `allowed_callers` is present for a service, it MUST be treated as an authorization input, not metadata. Directory poisoning or misregistration affects authorization decisions and routing.
 
 ### Directory data model (minimum)
 
@@ -774,13 +861,22 @@ For each service endpoint:
 
   * list of caller SPIFFE IDs or groups allowed to call this service
 
+Enforcement (normative):
+
+* Resolve-time: Directory MUST authenticate the resolver and MUST enforce `allowed_callers` by denying or filtering results for callers not in `allowed_callers`.
+* Call-time: the callee MUST enforce `allowed_callers` by checking `peer_spiffe_id` against the allowed set for its `service_id` (from a cached view of Directory policy or local configuration).
+
 ### Directory write access (Required)
 
 Only authenticated modules may register:
 
-* module registration MUST be authenticated using the issued identity (mTLS).
+* module registration MUST be authenticated using the issued identity (mTLS for network paths, or OS-authenticated local IPC for same host paths).
 * registration MUST be restricted so a module can register only what it is allowed to register (service id constraints).
-* Directory MUST bind the registered entry’s `spiffe_id` to the registering module’s peer SPIFFE ID from mTLS.
+* Directory MUST bind the registered entry’s `spiffe_id` to the registering module’s caller identity.
+
+Write authority (normative):
+
+* `owner_spiffe_id` and `allowed_callers` MUST be provisioned by control plane configuration (or operator action) and MUST NOT be set or overridden by module self-registration.
 
 Ownership rule:
 
@@ -791,7 +887,7 @@ Ownership rule:
 
 * data plane and modules may read, but:
 
-  * Directory access MUST use mTLS
+  * Directory access MUST use mTLS for network paths, and MAY use OS-authenticated local IPC for same host paths
   * Directory SPIFFE ID SHOULD be pinned/verified by clients
 
 ### Directory API sketch (Draft)
@@ -799,8 +895,8 @@ Ownership rule:
 TODO: Specify concrete API endpoints and a stable schema. Recommended minimum:
 
 * `GET /v1/resolve?service_id=<id>` → `{ service_id, spiffe_id, endpoints[], ttl }`
-* `POST /v1/register` (mTLS only) → idempotent replace of the caller’s registration for `service_id` (Directory binds `spiffe_id` from mTLS) with `{ service_id, endpoints[], metadata }`
-* `POST /v1/revoke` (mTLS only) → revoke a registration. Directory MUST allow a module to revoke its own registration for its `service_id`; `owner_spiffe_id` and operators MUST be able to revoke registrations.
+* `POST /v1/register` (authenticated channel only) → idempotent replace of the caller’s registration for `service_id` (Directory binds `spiffe_id` from caller identity) with `{ service_id, endpoints[], metadata }`
+* `POST /v1/revoke` (authenticated channel only) → revoke a registration. Directory MUST allow a module to revoke its own registration for its `service_id`; `owner_spiffe_id` and operators MUST be able to revoke registrations.
 
 Required client behavior:
 
@@ -810,6 +906,80 @@ Required client behavior:
 TODO: Define anti-poisoning controls: who can register which `service_id`, rate limits, replay protection, and how to revoke registrations in incident response.
 
 ---
+
+## Bootstrap and Enrollment: Boot Token (Required)
+
+### Definition and purpose
+
+A boot token is a short-lived, single-use credential minted by the control plane and delivered to a specific module instance for initial enrollment only.
+
+Purpose:
+
+* A boot token MUST be accepted only for initial SVID issuance via the Workload API.
+* A boot token MUST NOT be used for routine authentication, authorization, or service-to-service requests.
+
+External tokens are minted by external IdPs (out of scope). Boot tokens are minted by the control plane (in scope).
+
+### Boot token properties (normative)
+
+Boot tokens MUST be cryptographically verifiable (signed by a control-plane issuer) and MUST contain or be bound to:
+
+* `exp`: short TTL (recommended minutes).
+* Single-use semantics.
+* `spiffe_id`: the intended SPIFFE ID for the enrolling module instance (or an unambiguous module instance identity that deterministically maps to the target `spiffe_id`).
+* `aud`: the local Workload API (or the enrollment endpoint) as audience.
+* `iss`: boot token issuer id (control plane).
+* `jti`: unique identifier for replay protection.
+
+### Issuance rules (normative)
+
+* The control plane (Master Host / Module Orchestrator) MUST be the boot token issuer.
+* Boot tokens MUST be minted only after an authorization decision that the target module instance is permitted to enroll for the target `spiffe_id`.
+* Boot tokens MUST be minted per module instance launch or enrollment event and MUST NOT be long-lived.
+* The control plane SHOULD NOT mint boot tokens in advance without an explicit enrollment intent.
+
+### Delivery requirements by topology (normative)
+
+1. Same host on-prem:
+
+   * Boot tokens MUST be delivered over stdin or OS IPC with ACLs appropriate to the module process identity.
+   * Environment variable delivery is discouraged and MUST be used only when the environment is not externally observable, is not persisted, and the process environment is restricted by OS access controls.
+
+2. Kubernetes:
+
+   * Bootstrapping MUST use Kubernetes primitives and MUST avoid long-lived plaintext secrets.
+   * Preferred patterns include one of:
+     * init container authenticates to the control plane using a projected service account token, requests a short-lived boot token, writes it to an in-memory `emptyDir` volume mounted into the application container, and the token MUST be removed after enrollment,
+     * CSI Secret Store with rotation when an external secret provider is used, but long-lived plaintext boot tokens are prohibited.
+   * Long-lived plaintext secrets (for example, a boot token stored as a static Kubernetes Secret without rotation) MUST NOT be used.
+   * The application container MUST NOT start with a long-lived plaintext boot token.
+
+3. Multi-host on-prem:
+
+   * Boot token delivery over the network MUST NOT be unauthenticated.
+   * Boot token delivery MUST require out-of-band trust establishment or host attestation (for example, operator-mediated secure transfer, TPM-backed attestation, or a pre-established authenticated channel).
+   * Unauthenticated network delivery (HTTP, email, shared folders without access control) is forbidden.
+
+### Validation rules at the Workload API (normative)
+
+When a module requests an initial SVID using a boot token, the Workload API MUST:
+
+* Verify boot token signature and issuer (`iss`).
+* Verify expiry (`exp`) and reject expired tokens.
+* Verify audience (`aud`) matches the Workload API enrollment audience.
+* Verify the requested SPIFFE ID matches the boot token bound `spiffe_id`.
+* Enforce single-use by maintaining a replay cache keyed by `jti` for at least the token lifetime, and reject replays.
+
+### Audit logging requirements (normative)
+
+The control plane and Workload API MUST emit audit events for boot token lifecycle with stable `reason_code` values, including at minimum:
+
+* `BOOT_TOKEN_ISSUED`
+* `BOOT_TOKEN_DELIVERED`
+* `BOOT_TOKEN_REDEEMED`
+* `BOOT_TOKEN_REPLAY_DENIED`
+* `BOOT_TOKEN_INVALID`
+* `BOOT_TOKEN_EXPIRED`
 
 ## Lifecycle management and rotation (Required)
 
@@ -861,7 +1031,7 @@ This section describes the minimum emergency actions and real-time controls when
 ### Real-time containment levers (minimum)
 
 1. **External token revoked/expired**
-   * `api_ingress` MUST stop accepting it at the boundary.
+   * API Gateway (`api_gateway`) MUST stop accepting it at the boundary.
    * STS MUST refuse minting internal tokens derived from it (revocation propagation).
 
 2. **Internal token abuse**
@@ -947,6 +1117,60 @@ To make fail-closed behavior consistent across REST and gRPC, use stable reason 
 
 ---
 
+## Scenario conventions (participants, boundaries, and trusted channels)
+
+The scenarios below use the following conventions:
+
+* A diagram participant represents a distinct trust boundary. In on-prem scenarios, internal participants represent processes (and MAY represent a host-scoped control plane when components are co-located). In Kubernetes scenarios, internal workload participants represent pods (the init container is a separate container process within the same pod). External participants represent external systems.
+* Any channel that crosses a process boundary and can be reached via the network stack MUST be treated as hostile.
+* For hostile channels, mTLS with SPIFFE-shaped identities is mandatory.
+* In on-prem same host mode, OS-authenticated local IPC MAY be used instead of mTLS only when:
+  * the server MUST verify OS-level peer credentials,
+  * the caller identity MUST be mapped to a SPIFFE ID,
+  * authorization and audit MUST use SPIFFE ID semantics exactly as with mTLS.
+* Boot tokens are bootstrap credentials. Boot tokens MUST be delivered over a trusted delivery channel appropriate to the topology:
+  * on-prem same host: stdin or OS IPC with ACLs,
+  * Kubernetes: init container requests the boot token using a projected service account token and writes it to an in-memory volume for enrollment only,
+  * on-prem multi-host: out-of-band trust establishment or host attestation.
+  Boot tokens MUST NOT be delivered over an unauthenticated network channel.
+
+# Scenario 0. UI login and session (north-south) (Required)
+
+Browser-facing UI session handling. North-south flow that terminates at the boundary and then continues as Scenario 3.
+
+High-level requirements:
+
+* Browser UI authentication uses an external IdP login (Authorization Code + PKCE is typical).
+* External access tokens are minted by the External IdP during the Authorization Code + PKCE exchange, outside this system boundary.
+* The UI obtains an external access token.
+* The UI MAY use a BFF pattern with a backend session cookie, in which case the browser presents a session cookie to the BFF and the BFF presents the external access token to API Gateway (`api_gateway`).
+* The external access token is presented to API Gateway (`api_gateway`) (directly or via BFF), then API Gateway (`api_gateway`) calls STS exchange/mint and the internal flow continues as in Scenario 3.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant B as Browser UI
+  participant IDP as External IdP
+  participant BFF as UI Backend (optional BFF)
+  participant AG as API Gateway
+  participant STS as STS
+
+  B->>IDP: Authorization Code + PKCE (typical)
+  IDP-->>B: Authorization code
+  B->>IDP: Token exchange (PKCE)
+  IDP-->>B: External access token
+
+  alt BFF session cookie pattern
+    B->>BFF: Request with session cookie
+    BFF->>AG: Request + external access token
+  else Direct token to API Gateway
+    B->>AG: Request + external access token
+  end
+
+  AG->>STS: Exchange external token -> SecurityCtx
+  AG->>STS: Mint internal token (aud=target service)
+```
+
 # Scenario 1. Master Host startup (On-prem)
 
 Control plane initializes first. Data plane starts only after control plane is ready.
@@ -959,7 +1183,7 @@ sequenceDiagram
   participant CA as CA
   participant DIR as Directory
   participant STS as STS
-  participant AG as API Ingress
+  participant AG as API Gateway
 
   Note over CA,DIR: Co-located on-prem
 
@@ -969,12 +1193,18 @@ sequenceDiagram
   MH->>DIR: Initialize Directory
   MH->>STS: Initialize token minting + IdP plugins + JWKS endpoint
   CA-->>MH: Trust bundle (PEM)
-  MH->>AG: Start API Ingress with trust bundle + Directory/STS endpoints
+  MH->>AG: Start API Gateway with trust bundle + Directory/STS endpoints
 ```
 
 ---
 
 # Scenario 2. OoP Module startup and registration
+
+Boot token delivery channel is topology-dependent:
+
+* Same host on-prem: boot token is delivered over stdin or OS IPC with ACLs.
+* Kubernetes: init container authenticates to the control plane using a projected service account token, requests a short-lived boot token, writes it to an in-memory volume, and removes it after enrollment.
+* Multi-host on-prem: boot token delivery requires out-of-band trust or host attestation. Unauthenticated network delivery is forbidden.
 
 ```mermaid
 sequenceDiagram
@@ -987,13 +1217,14 @@ sequenceDiagram
 
   Note over CA,DIR: Co-located on-prem
 
-  MH->>MOD: Launch module with one-time boot token
+  MH->>MH: Mint one-time boot token (exp, jti, spiffe_id, aud)
+  MH->>MOD: Deliver one-time boot token via trusted channel (topology-specific)
   MOD->>MOD: Generate local keypair
   MOD->>WAPI: Request X.509 SVID (CSR + boot token)
   WAPI->>CA: Validate boot token -> SPIFFE-light ID
   CA-->>WAPI: Leaf cert + chain + trust bundle
   WAPI-->>MOD: Identity materials
-  MOD->>DIR: Register endpoint + SPIFFE-light ID (mTLS)
+  MOD->>DIR: Register endpoint + SPIFFE-light ID (authenticated channel)
   DIR-->>MOD: Ack
 ```
 
@@ -1001,20 +1232,28 @@ sequenceDiagram
 
 # Scenario 3. External REST request (north-south)
 
+Trust boundary and enforcement notes:
+
+* External access tokens terminate at API Gateway (`api_gateway`).
+* STS is the control-plane decision point for external token validation and internal token mint authorization. API Gateway (`api_gateway`) enforces STS outcomes.
+* Control-plane calls from API Gateway (`api_gateway`) to STS and Directory use mTLS in multi-host on-prem and Kubernetes. In same host on-prem mode, OS-authenticated local IPC MAY be used.
+
 ```mermaid
 sequenceDiagram
   autonumber
   participant C as External Client
-  participant AG as API Ingress
+  participant AG as API Gateway
   participant STS as STS
   participant DIR as Directory
   participant M1 as OoP Module
 
   C->>AG: REST request + external token
   AG->>STS: Exchange external token -> SecurityCtx (validate/introspect/map)
+  STS-->>AG: SecurityCtx (allow) or error (deny)
   AG->>STS: Mint internal token (aud=M1, resolved to SPIFFE ID, bound to external_exp)
+  STS-->>AG: Internal token or error (deny)
   AG->>DIR: Resolve M1 endpoint + SPIFFE ID
-  AG->>M1: REST/HTTP2 + mTLS + internal token
+  AG->>M1: REST/HTTP2 + authenticated channel + internal token
   M1->>M1: Validate peer identity + internal token + authZ
   M1-->>AG: Response
   AG-->>C: Response
@@ -1023,6 +1262,11 @@ sequenceDiagram
 ---
 
 # Scenario 4. Internal REST call (east-west, no ingress)
+
+Topology note:
+
+* In Kubernetes and on-prem multi-host mode, module-to-module transport MUST use mTLS.
+* In on-prem same host mode, module-to-module transport MAY use OS-authenticated local IPC, while preserving SPIFFE ID semantics for authorization and audit.
 
 ```mermaid
 sequenceDiagram
@@ -1034,7 +1278,7 @@ sequenceDiagram
 
   M1->>DIR: Resolve M2 endpoint + SPIFFE ID
   M1->>STS: Mint internal token (aud=M2, resolved to SPIFFE ID)
-  M1->>M2: REST/HTTP2 + mTLS + internal token
+  M1->>M2: REST/HTTP2 + authenticated channel + internal token
   M2->>M2: Validate peer SPIFFE-light ID
   M2->>M2: Validate internal token
   M2->>M2: Authorize operation (RBAC/ABAC)
@@ -1044,6 +1288,11 @@ sequenceDiagram
 ---
 
 # Scenario 5. gRPC between modules
+
+Topology note:
+
+* In Kubernetes and on-prem multi-host mode, module-to-module transport MUST use mTLS.
+* In on-prem same host mode, module-to-module transport MAY use OS-authenticated local IPC, while preserving SPIFFE ID semantics for authorization and audit.
 
 ```mermaid
 sequenceDiagram
@@ -1055,7 +1304,7 @@ sequenceDiagram
 
   M1->>DIR: Resolve gRPC endpoint + SPIFFE ID
   M1->>STS: Mint internal token (aud=M2, resolved to SPIFFE ID)
-  M1->>M2: gRPC + mTLS + metadata token
+  M1->>M2: gRPC + authenticated channel + metadata token
   M2->>M2: Validate peer identity and token
   M2->>M2: Authorize RPC method
   M2-->>M1: gRPC response
@@ -1095,10 +1344,11 @@ Migration path:
 
 ## Summary
 
-* `api_ingress` is data plane only
+* API Gateway (`api_gateway`) is data plane only
 * STS, CA, Directory are control plane
 * External identity ends at the boundary
 * Internal traffic is zero-trust, direct, and auditable
+* Bootstrap uses a control-plane minted, short-lived, single-use boot token for initial workload identity issuance
 * AuthZ is explicit and required at every module boundary
 * The system is ready for future scaling to SPIRE or a service mesh
 
